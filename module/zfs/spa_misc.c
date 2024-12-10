@@ -2437,6 +2437,8 @@ spa_init(spa_mode_t mode)
 	metaslab_stat_init();
 	brt_init();
 	ddt_init();
+	htddt_init();
+	bstt_init();
 	zio_init();
 	dmu_init();
 	zil_init();

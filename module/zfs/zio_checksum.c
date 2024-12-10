@@ -32,6 +32,7 @@
 #include <sys/zil.h>
 #include <sys/abd.h>
 #include <zfs_fletcher.h>
+#include <cityhash.h>
 
 /*
  * Checksum vectors.
@@ -344,9 +345,11 @@ zio_checksum_compute(zio_t *zio, enum zio_checksum checksum,
 	blkptr_t *bp = zio->io_bp;
 	uint64_t offset = zio->io_offset;
 	zio_checksum_info_t *ci = &zio_checksum_table[checksum];
-	zio_cksum_t cksum, saved;
+	zio_cksum_t cksum, saved, h_cksum, t_cksum;
+	abd_t *htabd;
 	spa_t *spa = zio->io_spa;
 	boolean_t insecure = (ci->ci_flags & ZCHECKSUM_FLAG_DEDUP) == 0;
+    uint64_t ht_abd_size = 0;
 
 	ASSERT((uint_t)checksum < ZIO_CHECKSUM_FUNCTIONS);
 	ASSERT(ci->ci_func[0] != NULL);
@@ -405,6 +408,32 @@ zio_checksum_compute(zio_t *zio, enum zio_checksum checksum,
 		if (BP_USES_CRYPT(bp) && BP_GET_TYPE(bp) != DMU_OT_OBJSET)
 			zio_checksum_handle_crypt(&cksum, &saved, insecure);
 		bp->blk_cksum = cksum;
+		/*
+		 * BP_SET_DEDUP will happen in ZIO_STAGE_WRITE_COMPRESS before ZIO_STAGE_CHECKSUM_GENERATE
+		 */
+		if (BP_GET_DEDUP(bp)) {
+
+			ht_abd_size = P2ROUNDUP_TYPED(size >> zfs_burst_htdde_right_shift, 1, uint64_t);
+
+			htabd = abd_alloc_linear(ht_abd_size, B_FALSE);
+
+			abd_copy_off(htabd, abd, 0, 0, ht_abd_size);
+			ci->ci_func[0](htabd, ht_abd_size, spa->spa_cksum_tmpls[checksum], &h_cksum);
+
+			bp->blk_h_cksum = cityhash4(h_cksum.zc_word[0],
+										h_cksum.zc_word[1],
+										h_cksum.zc_word[2],
+										h_cksum.zc_word[3]);
+
+			abd_copy_off(htabd, abd, 0, size - ht_abd_size, ht_abd_size);
+			ci->ci_func[0](htabd, ht_abd_size, spa->spa_cksum_tmpls[checksum], &t_cksum);
+
+			bp->blk_t_cksum = cityhash4(t_cksum.zc_word[0],
+										t_cksum.zc_word[1],
+										t_cksum.zc_word[2],
+										t_cksum.zc_word[3]);
+			abd_free(htabd);
+		}
 	}
 }
 
@@ -420,7 +449,13 @@ zio_checksum_error_impl(spa_t *spa, const blkptr_t *bp,
 
 	if (checksum >= ZIO_CHECKSUM_FUNCTIONS || ci->ci_func[0] == NULL)
 		return (SET_ERROR(EINVAL));
-
+	/*
+	 * Note that we skip checking ZIO_COMPRESS_BURST checksum because we set psize to burst_size and
+	 * psize will not be equal to the original psize so that the check will fail.
+	 */
+	if(bp != NULL && BP_GET_COMPRESS(bp) == ZIO_COMPRESS_BURST){
+		return (0);
+	}
 	zio_checksum_template_init(checksum, spa);
 
 	IMPLY(bp == NULL, ci->ci_flags & ZCHECKSUM_FLAG_EMBEDDED);

@@ -319,6 +319,7 @@ ZFS_OBJS := \
 	bpobj.o \
 	bptree.o \
 	bqueue.o \
+	burst_dedup.o \
 	brt.o \
 	btree.o \
 	dataset_kstats.o \

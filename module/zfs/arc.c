@@ -1455,7 +1455,7 @@ static boolean_t
 arc_cksum_is_equal(arc_buf_hdr_t *hdr, zio_t *zio)
 {
 	ASSERT(!BP_IS_EMBEDDED(zio->io_bp));
-	VERIFY3U(BP_GET_PSIZE(zio->io_bp), ==, HDR_GET_PSIZE(hdr));
+	// VERIFY3U(BP_GET_PSIZE(zio->io_bp), ==, HDR_GET_PSIZE(hdr));
 
 	/*
 	 * Block pointers always store the checksum for the logical data.
@@ -2115,7 +2115,9 @@ arc_buf_fill(arc_buf_t *buf, spa_t *spa, const zbookmark_phys_t *zb,
 		if (arc_buf_try_copy_decompressed_data(buf)) {
 			/* Skip byteswapping and checksumming (already done) */
 			return (0);
-		} else {
+		}else if(HDR_GET_COMPRESS(hdr) == ZIO_COMPRESS_BURST){
+			abd_copy_to_buf(buf->b_data, hdr->b_l1hdr.b_pabd, HDR_GET_LSIZE(hdr));
+		}else {
 			error = zio_decompress_data(HDR_GET_COMPRESS(hdr),
 			    hdr->b_l1hdr.b_pabd, buf->b_data,
 			    HDR_GET_PSIZE(hdr), HDR_GET_LSIZE(hdr),
@@ -5215,7 +5217,7 @@ arc_hdr_verify(arc_buf_hdr_t *hdr, blkptr_t *bp)
 			    BP_GET_COMPRESS(bp));
 		}
 		ASSERT3U(HDR_GET_LSIZE(hdr), ==, BP_GET_LSIZE(bp));
-		ASSERT3U(HDR_GET_PSIZE(hdr), ==, BP_GET_PSIZE(bp));
+		// ASSERT3U(HDR_GET_PSIZE(hdr), ==, BP_GET_PSIZE(bp));
 		ASSERT3U(!!HDR_PROTECTED(hdr), ==, BP_IS_PROTECTED(bp));
 	}
 }
@@ -5667,6 +5669,10 @@ top:
 				mutex_exit(hash_lock);
 			rc = SET_ERROR(ENOENT);
 			goto done;
+		}
+
+		if(BP_GET_COMPRESS(bp) == ZIO_COMPRESS_BURST){
+			psize = lsize;
 		}
 
 		if (hdr == NULL) {
@@ -6319,7 +6325,8 @@ arc_write_ready(zio_t *zio)
 	arc_buf_t *buf = callback->awcb_buf;
 	arc_buf_hdr_t *hdr = buf->b_hdr;
 	blkptr_t *bp = zio->io_bp;
-	uint64_t psize = BP_IS_HOLE(bp) ? 0 : BP_GET_PSIZE(bp);
+	// uint64_t psize = BP_IS_HOLE(bp) ? 0 : BP_GET_PSIZE(bp);
+	uint64_t psize = BP_IS_HOLE(bp) ? 0 : ((BP_GET_COMPRESS(bp) == ZIO_COMPRESS_BURST) ? BP_GET_LSIZE(bp): BP_GET_PSIZE(bp));
 	fstrans_cookie_t cookie = spl_fstrans_mark();
 
 	ASSERT(HDR_HAS_L1HDR(hdr));

@@ -73,6 +73,7 @@ nodist_libzpool_la_SOURCES = \
 	module/zfs/bpobj.c \
 	module/zfs/bptree.c \
 	module/zfs/bqueue.c \
+	module/zfs/burst_dedup.c \
 	module/zfs/btree.c \
 	module/zfs/brt.c \
 	module/zfs/dbuf.c \

@@ -375,7 +375,9 @@ typedef enum bp_embedded_type {
 typedef struct blkptr {
 	dva_t		blk_dva[SPA_DVAS_PER_BP]; /* Data Virtual Addresses */
 	uint64_t	blk_prop;	/* size, compression, type, etc	    */
-	uint64_t	blk_pad[2];	/* Extra space for the future	    */
+	// uint64_t	blk_pad[2];	/* Extra space for the future	    */
+	uint64_t    blk_h_cksum; /* 64-bit checksum for burst dedup */
+	uint64_t    blk_t_cksum; /* 64-bit checksum for burst dedup */
 	uint64_t	blk_phys_birth;	/* txg when block was allocated	    */
 	uint64_t	blk_birth;	/* transaction group at birth	    */
 	uint64_t	blk_fill;	/* fill count			    */
@@ -581,8 +583,8 @@ typedef struct blkptr {
 	(bp)->blk_dva[2].dva_word[0] = 0;	\
 	(bp)->blk_dva[2].dva_word[1] = 0;	\
 	(bp)->blk_prop = 0;			\
-	(bp)->blk_pad[0] = 0;			\
-	(bp)->blk_pad[1] = 0;			\
+	(bp)->blk_h_cksum = 0;			\
+	(bp)->blk_t_cksum = 0;			\
 	(bp)->blk_phys_birth = 0;		\
 	(bp)->blk_birth = 0;			\
 	(bp)->blk_fill = 0;			\

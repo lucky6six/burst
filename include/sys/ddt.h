@@ -146,6 +146,9 @@ struct ddt {
 	ddt_histogram_t	ddt_histogram[DDT_TYPES][DDT_CLASSES];
 	ddt_histogram_t	ddt_histogram_cache[DDT_TYPES][DDT_CLASSES];
 	ddt_object_t	ddt_object_stats[DDT_TYPES][DDT_CLASSES];
+	uint64_t ddt_dedupratio_size;
+	uint64_t ddt_dedupratio_ref_size;
+	uint8_t ddt_dedupratio_updated;
 	avl_node_t	ddt_node;
 };
 
@@ -179,7 +182,7 @@ typedef struct ddt_ops {
 	int (*ddt_op_count)(objset_t *os, uint64_t object, uint64_t *count);
 } ddt_ops_t;
 
-#define	DDT_NAMELEN	107
+#define	DDT_NAMELEN	102
 
 extern void ddt_object_name(ddt_t *ddt, enum ddt_type type,
     enum ddt_class clazz, char *name);
@@ -200,7 +203,7 @@ extern void ddt_bp_create(enum zio_checksum checksum, const ddt_key_t *ddk,
 extern void ddt_key_fill(ddt_key_t *ddk, const blkptr_t *bp);
 
 extern void ddt_phys_fill(ddt_phys_t *ddp, const blkptr_t *bp);
-extern void ddt_phys_clear(ddt_phys_t *ddp);
+// extern void ddt_phys_clear(ddt_phys_t *ddp);
 extern void ddt_phys_addref(ddt_phys_t *ddp);
 extern void ddt_phys_decref(ddt_phys_t *ddp);
 extern void ddt_phys_free(ddt_t *ddt, ddt_key_t *ddk, ddt_phys_t *ddp,
@@ -214,6 +217,7 @@ extern void ddt_histogram_add(ddt_histogram_t *dst, const ddt_histogram_t *src);
 extern void ddt_histogram_stat(ddt_stat_t *dds, const ddt_histogram_t *ddh);
 extern boolean_t ddt_histogram_empty(const ddt_histogram_t *ddh);
 extern void ddt_get_dedup_object_stats(spa_t *spa, ddt_object_t *ddo);
+extern void ddt_grnerate_dedup_histogram(spa_t *spa);
 extern void ddt_get_dedup_histogram(spa_t *spa, ddt_histogram_t *ddh);
 extern void ddt_get_dedup_stats(spa_t *spa, ddt_stat_t *dds_total);
 
@@ -228,8 +232,9 @@ extern void ddt_enter(ddt_t *ddt);
 extern void ddt_exit(ddt_t *ddt);
 extern void ddt_init(void);
 extern void ddt_fini(void);
-extern ddt_entry_t *ddt_lookup(ddt_t *ddt, const blkptr_t *bp, boolean_t add);
+extern ddt_entry_t *ddt_lookup(ddt_t *ddt, const blkptr_t *bp, boolean_t add, boolean_t *found);
 extern void ddt_prefetch(spa_t *spa, const blkptr_t *bp);
+extern boolean_t ddt_exist(ddt_t *ddt, ddt_entry_t *dde);
 extern void ddt_remove(ddt_t *ddt, ddt_entry_t *dde);
 
 extern boolean_t ddt_class_contains(spa_t *spa, enum ddt_class max_class,

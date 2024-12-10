@@ -250,6 +250,7 @@ SRCS+=	abd.c \
 	dbuf_stats.c \
 	bptree.c \
 	bqueue.c \
+	burst_dedup.c \
 	dataset_kstats.c \
 	ddt.c \
 	ddt_zap.c \

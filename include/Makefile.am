@@ -31,6 +31,7 @@ COMMON_H = \
 	sys/bpobj.h \
 	sys/bptree.h \
 	sys/bqueue.h \
+	sys/burst_dedup.h \
 	sys/btree.h \
 	sys/brt.h \
 	sys/dataset_kstats.h \

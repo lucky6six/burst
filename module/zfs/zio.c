@@ -51,6 +51,7 @@
 #include <sys/trace_zfs.h>
 #include <sys/abd.h>
 #include <sys/dsl_crypt.h>
+#include <sys/burst_dedup.h>
 #include <cityhash.h>
 
 /*
@@ -980,8 +981,8 @@ zfs_blkptr_verify_log(spa_t *spa, const blkptr_t *bp,
 	    (long long)bp->blk_dva[2].dva_word[0],
 	    (long long)bp->blk_dva[2].dva_word[1],
 	    (long long)bp->blk_prop,
-	    (long long)bp->blk_pad[0],
-	    (long long)bp->blk_pad[1],
+	    (long long)bp->blk_h_cksum,
+	    (long long)bp->blk_t_cksum,
 	    (long long)bp->blk_phys_birth,
 	    (long long)bp->blk_birth,
 	    (long long)bp->blk_fill,
@@ -3149,104 +3150,193 @@ zio_brt_free(zio_t *zio)
  * Dedup
  * ==========================================================================
  */
+// static void
+// zio_ddt_child_read_done(zio_t *zio)
+// {
+// 	blkptr_t *bp = zio->io_bp;
+// 	ddt_entry_t *dde = zio->io_private;
+// 	ddt_phys_t *ddp;
+// 	zio_t *pio = zio_unique_parent(zio);
+
+// 	mutex_enter(&pio->io_lock);
+// 	ddp = ddt_phys_select(dde, bp);
+// 	if (zio->io_error == 0)
+// 		ddt_phys_clear(ddp);	/* this ddp doesn't need repair */
+
+// 	if (zio->io_error == 0 && dde->dde_repair_abd == NULL)
+// 		dde->dde_repair_abd = zio->io_abd;
+// 	else
+// 		abd_free(zio->io_abd);
+// 	mutex_exit(&pio->io_lock);
+// }
+
 static void
-zio_ddt_child_read_done(zio_t *zio)
+zio_ddt_based_read_done(zio_t *zio)
 {
-	blkptr_t *bp = zio->io_bp;
-	ddt_entry_t *dde = zio->io_private;
-	ddt_phys_t *ddp;
+	burst_t *burst = zio->io_private;
 	zio_t *pio = zio_unique_parent(zio);
-
-	mutex_enter(&pio->io_lock);
-	ddp = ddt_phys_select(dde, bp);
-	if (zio->io_error == 0)
-		ddt_phys_clear(ddp);	/* this ddp doesn't need repair */
-
-	if (zio->io_error == 0 && dde->dde_repair_abd == NULL)
-		dde->dde_repair_abd = zio->io_abd;
-	else
-		abd_free(zio->io_abd);
-	mutex_exit(&pio->io_lock);
+	bstt_create_data(burst, zio->io_abd, zio->io_size, pio->io_abd, pio->io_size);
+	abd_free(zio->io_abd);
 }
+
+// static zio_t *
+// zio_ddt_read_start(zio_t *zio)
+// {
+// 	blkptr_t *bp = zio->io_bp;
+
+// 	ASSERT(BP_GET_DEDUP(bp));
+// 	ASSERT(BP_GET_PSIZE(bp) == zio->io_size);
+// 	ASSERT(zio->io_child_type == ZIO_CHILD_LOGICAL);
+
+// 	if (zio->io_child_error[ZIO_CHILD_DDT]) {
+// 		ddt_t *ddt = ddt_select(zio->io_spa, bp);
+// 		ddt_entry_t *dde = ddt_repair_start(ddt, bp);
+// 		ddt_phys_t *ddp = dde->dde_phys;
+// 		ddt_phys_t *ddp_self = ddt_phys_select(dde, bp);
+// 		blkptr_t blk;
+
+// 		ASSERT(zio->io_vsd == NULL);
+// 		zio->io_vsd = dde;
+
+// 		if (ddp_self == NULL)
+// 			return (zio);
+
+// 		for (int p = 0; p < DDT_PHYS_TYPES; p++, ddp++) {
+// 			if (ddp->ddp_phys_birth == 0 || ddp == ddp_self)
+// 				continue;
+// 			ddt_bp_create(ddt->ddt_checksum, &dde->dde_key, ddp,
+// 			    &blk);
+// 			zio_nowait(zio_read(zio, zio->io_spa, &blk,
+// 			    abd_alloc_for_io(zio->io_size, B_TRUE),
+// 			    zio->io_size, zio_ddt_child_read_done, dde,
+// 			    zio->io_priority, ZIO_DDT_CHILD_FLAGS(zio) |
+// 			    ZIO_FLAG_DONT_PROPAGATE, &zio->io_bookmark));
+// 		}
+// 		return (zio);
+// 	}
+
+// 	zio_nowait(zio_read(zio, zio->io_spa, bp,
+// 	    zio->io_abd, zio->io_size, NULL, NULL, zio->io_priority,
+// 	    ZIO_DDT_CHILD_FLAGS(zio), &zio->io_bookmark));
+
+// 	return (zio);
+// }
 
 static zio_t *
 zio_ddt_read_start(zio_t *zio)
 {
 	blkptr_t *bp = zio->io_bp;
+	ddt_t *ddt = ddt_select(zio->io_spa, bp);
+	bstt_t *bstt = bstt_select(zio->io_spa, bp);
+	bstt_entry_t *bste;
+	bstt_key_t bstk_search;
+	ddt_entry_t *bstp_dde;
+	uint8_t bstp_p;
+	ddt_phys_t *bstp_ddp;
+	burst_t *burst;
+	blkptr_t burst_blk;
+	blkptr_t based_blk;
+	abd_t *based_io_abd;
+	zio_t *based_io;
 
 	ASSERT(BP_GET_DEDUP(bp));
-	ASSERT(BP_GET_PSIZE(bp) == zio->io_size);
 	ASSERT(zio->io_child_type == ZIO_CHILD_LOGICAL);
 
-	if (zio->io_child_error[ZIO_CHILD_DDT]) {
-		ddt_t *ddt = ddt_select(zio->io_spa, bp);
-		ddt_entry_t *dde = ddt_repair_start(ddt, bp);
-		ddt_phys_t *ddp = dde->dde_phys;
-		ddt_phys_t *ddp_self = ddt_phys_select(dde, bp);
-		blkptr_t blk;
+	bstk_search.bstk_cksum = bp->blk_cksum;
 
-		ASSERT(zio->io_vsd == NULL);
-		zio->io_vsd = dde;
+	/* this block have no burst data so just call zio_read() */
+	if (BP_GET_COMPRESS(bp) != ZIO_COMPRESS_BURST){
+		zio_nowait(zio_read(zio, zio->io_spa, bp, zio->io_abd, zio->io_size, NULL, NULL, zio->io_priority, ZIO_DDT_CHILD_FLAGS(zio), &zio->io_bookmark));
+		return (zio);
+	}
+	ddt_enter(ddt);
+	bste = bstt_lookup(bstt, &bstk_search, B_FALSE);
+	ASSERT(bste != NULL);
 
-		if (ddp_self == NULL)
-			return (zio);
+	bstp_dde = bste->bste_phys.bstp_dde;
+	bstp_p = bste->bste_phys.bstp_dde_p;
+	bstp_ddp = &(bstp_dde->dde_phys[bstp_p]);
 
-		for (int p = 0; p < DDT_PHYS_TYPES; p++, ddp++) {
-			if (ddp->ddp_phys_birth == 0 || ddp == ddp_self)
-				continue;
-			ddt_bp_create(ddt->ddt_checksum, &dde->dde_key, ddp,
-			    &blk);
-			zio_nowait(zio_read(zio, zio->io_spa, &blk,
-			    abd_alloc_for_io(zio->io_size, B_TRUE),
-			    zio->io_size, zio_ddt_child_read_done, dde,
-			    zio->io_priority, ZIO_DDT_CHILD_FLAGS(zio) |
-			    ZIO_FLAG_DONT_PROPAGATE, &zio->io_bookmark));
-		}
+	/* based_data not ready, restart current zio */
+	if (bstp_dde->dde_lead_zio[bstp_p] != NULL){
+		zfs_burst_dedup_dbgmsg("=====burst-dedup=====based_data not ready, restart current zio: %px", zio);
+		zio_pop_transforms(zio);
+		zio->io_stage = ZIO_STAGE_OPEN;
+		zio->io_pipeline = ZIO_READ_PIPELINE;
+		ddt_exit(ddt);
 		return (zio);
 	}
 
-	zio_nowait(zio_read(zio, zio->io_spa, bp,
-	    zio->io_abd, zio->io_size, NULL, NULL, zio->io_priority,
-	    ZIO_DDT_CHILD_FLAGS(zio), &zio->io_bookmark));
+	burst = &(bste->bste_phys.bstp_burst);
 
+	if (burst->burst_abd == NULL){
+		zfs_burst_dedup_dbgmsg("=====burst-dedup=====bste(%px) has empty burst_abd, load it first. zio: %px", bste, zio);
+
+		bstt_bp_create(ddt->ddt_checksum, &(bste->bste_key), &(bste->bste_phys), &burst_blk);
+		ASSERT3U(BP_GET_PSIZE(&burst_blk), ==, burst->burst_abd_size);
+		burst->burst_abd = abd_alloc(burst->burst_abd_size, B_FALSE);
+
+		zio_wait(zio_read(zio, zio->io_spa, &burst_blk, burst->burst_abd, burst->burst_abd_size, NULL, NULL, zio->io_priority, ZIO_DDT_CHILD_FLAGS(zio), &zio->io_bookmark));
+
+	}
+
+	ddt_bp_create(ddt->ddt_checksum, &(bstp_dde->dde_key), bstp_ddp, &based_blk);
+
+	based_io_abd = abd_alloc(bste->bste_phys.bstp_abd_size, B_FALSE);
+	based_io = zio_read(zio, zio->io_spa, &based_blk, based_io_abd, based_io_abd->abd_size, zio_ddt_based_read_done, burst, zio->io_priority,
+	ZIO_DDT_CHILD_FLAGS(zio), &zio->io_bookmark);
+
+	ddt_exit(ddt);
+	zio_nowait(based_io);
 	return (zio);
 }
+
+
+// static zio_t *
+// zio_ddt_read_done(zio_t *zio)
+// {
+// 	blkptr_t *bp = zio->io_bp;
+
+// 	if (zio_wait_for_children(zio, ZIO_CHILD_DDT_BIT, ZIO_WAIT_DONE)) {
+// 		return (NULL);
+// 	}
+
+// 	ASSERT(BP_GET_DEDUP(bp));
+// 	ASSERT(BP_GET_PSIZE(bp) == zio->io_size);
+// 	ASSERT(zio->io_child_type == ZIO_CHILD_LOGICAL);
+
+// 	if (zio->io_child_error[ZIO_CHILD_DDT]) {
+// 		ddt_t *ddt = ddt_select(zio->io_spa, bp);
+// 		ddt_entry_t *dde = zio->io_vsd;
+// 		if (ddt == NULL) {
+// 			ASSERT(spa_load_state(zio->io_spa) != SPA_LOAD_NONE);
+// 			return (zio);
+// 		}
+// 		if (dde == NULL) {
+// 			zio->io_stage = ZIO_STAGE_DDT_READ_START >> 1;
+// 			zio_taskq_dispatch(zio, ZIO_TASKQ_ISSUE, B_FALSE);
+// 			return (NULL);
+// 		}
+// 		if (dde->dde_repair_abd != NULL) {
+// 			abd_copy(zio->io_abd, dde->dde_repair_abd,
+// 			    zio->io_size);
+// 			zio->io_child_error[ZIO_CHILD_DDT] = 0;
+// 		}
+// 		ddt_repair_done(ddt, dde);
+// 		zio->io_vsd = NULL;
+// 	}
+
+// 	ASSERT(zio->io_vsd == NULL);
+
+// 	return (zio);
+// }
 
 static zio_t *
 zio_ddt_read_done(zio_t *zio)
 {
-	blkptr_t *bp = zio->io_bp;
-
 	if (zio_wait_for_children(zio, ZIO_CHILD_DDT_BIT, ZIO_WAIT_DONE)) {
 		return (NULL);
 	}
-
-	ASSERT(BP_GET_DEDUP(bp));
-	ASSERT(BP_GET_PSIZE(bp) == zio->io_size);
-	ASSERT(zio->io_child_type == ZIO_CHILD_LOGICAL);
-
-	if (zio->io_child_error[ZIO_CHILD_DDT]) {
-		ddt_t *ddt = ddt_select(zio->io_spa, bp);
-		ddt_entry_t *dde = zio->io_vsd;
-		if (ddt == NULL) {
-			ASSERT(spa_load_state(zio->io_spa) != SPA_LOAD_NONE);
-			return (zio);
-		}
-		if (dde == NULL) {
-			zio->io_stage = ZIO_STAGE_DDT_READ_START >> 1;
-			zio_taskq_dispatch(zio, ZIO_TASKQ_ISSUE, B_FALSE);
-			return (NULL);
-		}
-		if (dde->dde_repair_abd != NULL) {
-			abd_copy(zio->io_abd, dde->dde_repair_abd,
-			    zio->io_size);
-			zio->io_child_error[ZIO_CHILD_DDT] = 0;
-		}
-		ddt_repair_done(ddt, dde);
-		zio->io_vsd = NULL;
-	}
-
-	ASSERT(zio->io_vsd == NULL);
 
 	return (zio);
 }
@@ -3348,6 +3438,104 @@ zio_ddt_collision(zio_t *zio, ddt_t *ddt, ddt_entry_t *dde)
 	return (B_FALSE);
 }
 
+// static void
+// zio_ddt_child_write_ready(zio_t *zio)
+// {
+// 	int p = zio->io_prop.zp_copies;
+// 	ddt_t *ddt = ddt_select(zio->io_spa, zio->io_bp);
+// 	ddt_entry_t *dde = zio->io_private;
+// 	ddt_phys_t *ddp = &dde->dde_phys[p];
+// 	zio_t *pio;
+
+// 	if (zio->io_error)
+// 		return;
+
+// 	ddt_enter(ddt);
+
+// 	ASSERT(dde->dde_lead_zio[p] == zio);
+
+// 	ddt_phys_fill(ddp, zio->io_bp);
+
+// 	zio_link_t *zl = NULL;
+// 	while ((pio = zio_walk_parents(zio, &zl)) != NULL)
+// 		ddt_bp_fill(ddp, pio->io_bp, zio->io_txg);
+
+// 	ddt_exit(ddt);
+// }
+
+static void
+zio_ddt_burst_write_ready(zio_t *zio)
+{
+	bstt_entry_t *bste = (bstt_entry_t *)zio->io_private;
+	ddt_t *ddt = ddt_select(zio->io_spa, zio->io_bp);
+	zio_t *pio = NULL;
+
+	if (zio->io_error)
+		return;
+	char blkbuf[BP_SPRINTF_LEN];
+	snprintf_blkptr(blkbuf, sizeof(blkbuf), zio->io_bp);
+
+	ddt_enter(ddt);
+
+	bstt_bstp_fill(&(bste->bste_phys), zio->io_bp);
+
+	zio_link_t *zl = NULL;
+	while ((pio = zio_walk_parents(zio, &zl)) != NULL)
+		bstt_bp_fill(&(bste->bste_phys), pio->io_bp, zio->io_txg);
+
+	ddt_exit(ddt);
+}
+
+// static void
+// zio_ddt_child_write_done(zio_t *zio)
+// {
+// 	int p = zio->io_prop.zp_copies;
+// 	ddt_t *ddt = ddt_select(zio->io_spa, zio->io_bp);
+// 	ddt_entry_t *dde = zio->io_private;
+// 	ddt_phys_t *ddp = &dde->dde_phys[p];
+
+// 	ddt_enter(ddt);
+
+// 	ASSERT(ddp->ddp_refcnt == 0);
+// 	ASSERT(dde->dde_lead_zio[p] == zio);
+// 	dde->dde_lead_zio[p] = NULL;
+
+// 	if (zio->io_error == 0) {
+// 		zio_link_t *zl = NULL;
+// 		while (zio_walk_parents(zio, &zl) != NULL)
+// 			ddt_phys_addref(ddp);
+// 	} else {
+// 		ddt_phys_clear(ddp);
+// 	}
+
+// 	ddt_exit(ddt);
+// }
+
+static void
+zio_ddt_burst_write_done(zio_t *zio)
+{
+	bstt_entry_t *bste = (bstt_entry_t *)zio->io_private;
+	ddt_t *ddt = ddt_select(zio->io_spa, zio->io_bp);
+	zio_t *pio = NULL;
+
+	ddt_enter(ddt);
+
+	bste->bste_lead_burst_io = NULL;
+
+	zio_link_t *zl = NULL;
+	while ((pio = zio_walk_parents(zio, &zl)) != NULL){
+		bstt_phys_addref(zio, &(bste->bste_phys));
+	}
+
+	ASSERT3P(zio->io_abd, ==, bste->bste_phys.bstp_burst.burst_abd);
+	abd_free(zio->io_abd);
+	bste->bste_phys.bstp_burst.burst_abd = NULL;
+
+	ddt_exit(ddt);
+
+}
+
+
 static void
 zio_ddt_child_write_ready(zio_t *zio)
 {
@@ -3364,6 +3552,8 @@ zio_ddt_child_write_ready(zio_t *zio)
 
 	ASSERT(dde->dde_lead_zio[p] == zio);
 
+	char blkbuf[BP_SPRINTF_LEN];
+	snprintf_blkptr(blkbuf, sizeof(blkbuf), zio->io_bp);
 	ddt_phys_fill(ddp, zio->io_bp);
 
 	zio_link_t *zl = NULL;
@@ -3387,15 +3577,121 @@ zio_ddt_child_write_done(zio_t *zio)
 	ASSERT(dde->dde_lead_zio[p] == zio);
 	dde->dde_lead_zio[p] = NULL;
 
-	if (zio->io_error == 0) {
-		zio_link_t *zl = NULL;
-		while (zio_walk_parents(zio, &zl) != NULL)
-			ddt_phys_addref(ddp);
-	} else {
-		ddt_phys_clear(ddp);
+	char blkbuf[BP_SPRINTF_LEN];
+	snprintf_blkptr(blkbuf, sizeof(blkbuf), zio->io_bp);
+	zio_link_t *zl = NULL;
+	while (zio_walk_parents(zio, &zl) != NULL){
+		ddt_phys_addref(ddp);
 	}
-
 	ddt_exit(ddt);
+}
+
+
+// static zio_t *
+// zio_ddt_write(zio_t *zio)
+// {
+// 	spa_t *spa = zio->io_spa;
+// 	blkptr_t *bp = zio->io_bp;
+// 	uint64_t txg = zio->io_txg;
+// 	zio_prop_t *zp = &zio->io_prop;
+// 	int p = zp->zp_copies;
+// 	zio_t *cio = NULL;
+// 	ddt_t *ddt = ddt_select(spa, bp);
+// 	ddt_entry_t *dde;
+// 	ddt_phys_t *ddp;
+
+// 	ASSERT(BP_GET_DEDUP(bp));
+// 	ASSERT(BP_GET_CHECKSUM(bp) == zp->zp_checksum);
+// 	ASSERT(BP_IS_HOLE(bp) || zio->io_bp_override);
+// 	ASSERT(!(zio->io_bp_override && (zio->io_flags & ZIO_FLAG_RAW)));
+
+// 	ddt_enter(ddt);
+// 	dde = ddt_lookup(ddt, bp, B_TRUE);
+// 	ddp = &dde->dde_phys[p];
+
+// 	if (zp->zp_dedup_verify && zio_ddt_collision(zio, ddt, dde)) {
+// 		/*
+// 		 * If we're using a weak checksum, upgrade to a strong checksum
+// 		 * and try again.  If we're already using a strong checksum,
+// 		 * we can't resolve it, so just convert to an ordinary write.
+// 		 * (And automatically e-mail a paper to Nature?)
+// 		 */
+// 		if (!(zio_checksum_table[zp->zp_checksum].ci_flags &
+// 		    ZCHECKSUM_FLAG_DEDUP)) {
+// 			zp->zp_checksum = spa_dedup_checksum(spa);
+// 			zio_pop_transforms(zio);
+// 			zio->io_stage = ZIO_STAGE_OPEN;
+// 			BP_ZERO(bp);
+// 		} else {
+// 			zp->zp_dedup = B_FALSE;
+// 			BP_SET_DEDUP(bp, B_FALSE);
+// 		}
+// 		ASSERT(!BP_GET_DEDUP(bp));
+// 		zio->io_pipeline = ZIO_WRITE_PIPELINE;
+// 		ddt_exit(ddt);
+// 		return (zio);
+// 	}
+
+// 	if (ddp->ddp_phys_birth != 0 || dde->dde_lead_zio[p] != NULL) {
+// 		if (ddp->ddp_phys_birth != 0)
+// 			ddt_bp_fill(ddp, bp, txg);
+// 		if (dde->dde_lead_zio[p] != NULL)
+// 			zio_add_child(zio, dde->dde_lead_zio[p]);
+// 		else
+// 			ddt_phys_addref(ddp);
+// 	} else if (zio->io_bp_override) {
+// 		ASSERT(bp->blk_birth == txg);
+// 		ASSERT(BP_EQUAL(bp, zio->io_bp_override));
+// 		ddt_phys_fill(ddp, bp);
+// 		ddt_phys_addref(ddp);
+// 	} else {
+// 		cio = zio_write(zio, spa, txg, bp, zio->io_orig_abd,
+// 		    zio->io_orig_size, zio->io_orig_size, zp,
+// 		    zio_ddt_child_write_ready, NULL,
+// 		    zio_ddt_child_write_done, dde, zio->io_priority,
+// 		    ZIO_DDT_CHILD_FLAGS(zio), &zio->io_bookmark);
+
+// 		zio_push_transform(cio, zio->io_abd, zio->io_size, 0, NULL);
+// 		dde->dde_lead_zio[p] = cio;
+// 	}
+
+// 	ddt_exit(ddt);
+
+// 	zio_nowait(cio);
+
+// 	return (zio);
+// }
+
+static boolean_t
+zio_handle_collision(zio_t *zio, ddt_t *ddt, ddt_entry_t *dde)
+{
+	ASSERT(MUTEX_HELD(&ddt->ddt_lock));
+	zio_prop_t *zp = &zio->io_prop;
+	blkptr_t *bp = zio->io_bp;
+	if (zp->zp_dedup_verify && zio_ddt_collision(zio, ddt, dde)) {
+		/*
+		 * If we're using a weak checksum, upgrade to a strong checksum
+		 * and try again.  If we're already using a strong checksum,
+		 * we can't resolve it, so just convert to an ordinary write.
+		 * (And automatically e-mail a paper to Nature?)
+		 */
+		zfs_burst_dedup_dbgmsg("=====burst-dedup=====zio_ddt_collision detected.");
+		if (!(zio_checksum_table[zp->zp_checksum].ci_flags &
+		    ZCHECKSUM_FLAG_DEDUP)) {
+			zp->zp_checksum = spa_dedup_checksum(zio->io_spa);
+			zio_pop_transforms(zio);
+			zio->io_stage = ZIO_STAGE_OPEN;
+			BP_ZERO(bp);
+		} else {
+			zp->zp_dedup = B_FALSE;
+			BP_SET_DEDUP(bp, B_FALSE);
+		}
+		ASSERT(!BP_GET_DEDUP(bp));
+		zio->io_pipeline = ZIO_WRITE_PIPELINE;
+		return B_TRUE;
+	}else{
+		return B_FALSE;
+	}
 }
 
 static zio_t *
@@ -3406,70 +3702,210 @@ zio_ddt_write(zio_t *zio)
 	uint64_t txg = zio->io_txg;
 	zio_prop_t *zp = &zio->io_prop;
 	int p = zp->zp_copies;
-	zio_t *cio = NULL;
 	ddt_t *ddt = ddt_select(spa, bp);
-	ddt_entry_t *dde;
-	ddt_phys_t *ddp;
+	htddt_t *hddt = htddt_select(spa, bp, HTDDT_TYPE_HEAD);
+	htddt_t *tddt = htddt_select(spa, bp ,HTDDT_TYPE_TAIL);
+	bstt_t *bstt = bstt_select(spa, bp);
+
+	ddt_entry_t *dde = NULL;
+	htddt_entry_t *htdde = NULL;
+	bstt_entry_t *bste = NULL;
+
+
+	htddt_key_t hddk_search;
+	htddt_key_t tddk_search;
+	bstt_key_t bstk_search;
+
+	// for debug usage
+	boolean_t found_dde = B_FALSE;
 
 	ASSERT(BP_GET_DEDUP(bp));
 	ASSERT(BP_GET_CHECKSUM(bp) == zp->zp_checksum);
 	ASSERT(BP_IS_HOLE(bp) || zio->io_bp_override);
 	ASSERT(!(zio->io_bp_override && (zio->io_flags & ZIO_FLAG_RAW)));
-
 	ddt_enter(ddt);
-	dde = ddt_lookup(ddt, bp, B_TRUE);
-	ddp = &dde->dde_phys[p];
 
-	if (zp->zp_dedup_verify && zio_ddt_collision(zio, ddt, dde)) {
-		/*
-		 * If we're using a weak checksum, upgrade to a strong checksum
-		 * and try again.  If we're already using a strong checksum,
-		 * we can't resolve it, so just convert to an ordinary write.
-		 * (And automatically e-mail a paper to Nature?)
-		 */
-		if (!(zio_checksum_table[zp->zp_checksum].ci_flags &
-		    ZCHECKSUM_FLAG_DEDUP)) {
-			zp->zp_checksum = spa_dedup_checksum(spa);
-			zio_pop_transforms(zio);
-			zio->io_stage = ZIO_STAGE_OPEN;
-			BP_ZERO(bp);
-		} else {
-			zp->zp_dedup = B_FALSE;
-			BP_SET_DEDUP(bp, B_FALSE);
+// --------------------------------------------------------------------------------------------
+
+	ddt->ddt_dedupratio_updated = 1;
+
+	dde = ddt_lookup(ddt, bp, B_TRUE, &found_dde);
+
+	if(zio_handle_collision(zio, ddt, dde)){
+		ddt_exit(ddt);
+		return (zio);
+
+	}
+
+	if(found_dde){
+		ddt_phys_t *ddp= &dde->dde_phys[p];
+		if (ddp->ddp_phys_birth != 0 || dde->dde_lead_zio[p] != NULL) {
+			if (ddp->ddp_phys_birth != 0){
+				ddt_bp_fill(ddp, bp, txg);
+
+			}
+			if (dde->dde_lead_zio[p] != NULL){
+				zio_add_child(zio, dde->dde_lead_zio[p]);
+			}
+			else{
+				ddt_phys_addref(ddp);
+			}
+		} else if (zio->io_bp_override) {
+			zfs_burst_dedup_dbgmsg("=====burst-dedup=====TRUE: zio->io_bp_override, zio: %px", zio);
+			ASSERT(bp->blk_birth == txg);
+			ASSERT(BP_EQUAL(bp, zio->io_bp_override));
+			ddt_phys_fill(ddp, bp);
+			ddt_phys_addref(ddp);
 		}
-		ASSERT(!BP_GET_DEDUP(bp));
-		zio->io_pipeline = ZIO_WRITE_PIPELINE;
+		else{
+			zfs_burst_dedup_dbgmsg("=====burst-dedup=====ALERT: could this happen? , zio: %px", zio);
+		}
+
 		ddt_exit(ddt);
 		return (zio);
 	}
+// --------------------------------------------------------------------------------------------
+	bstk_search.bstk_cksum = bp->blk_cksum;
+	bste = bstt_lookup(bstt, &bstk_search, B_FALSE);
+	if(bste != NULL){
+		if(ddt_exist(ddt, bste->bste_phys.bstp_dde)){
+			ddt_remove(ddt, dde);
+			if(bste->bste_phys.bstp_phys_birth != 0){
+				bstt_bp_fill(&(bste->bste_phys), bp, txg);
+			}
+			if(bste->bste_lead_burst_io != NULL){
+				zio_add_child(zio, bste->bste_lead_burst_io);
+			}
+			else{
+				bstt_phys_addref(zio, &(bste->bste_phys));
+			}
+			ddt_exit(ddt);
+			return (zio);
+		}
+	}
+// --------------------------------------------------------------------------------------------
 
-	if (ddp->ddp_phys_birth != 0 || dde->dde_lead_zio[p] != NULL) {
-		if (ddp->ddp_phys_birth != 0)
-			ddt_bp_fill(ddp, bp, txg);
-		if (dde->dde_lead_zio[p] != NULL)
-			zio_add_child(zio, dde->dde_lead_zio[p]);
-		else
-			ddt_phys_addref(ddp);
-	} else if (zio->io_bp_override) {
-		ASSERT(bp->blk_birth == txg);
-		ASSERT(BP_EQUAL(bp, zio->io_bp_override));
-		ddt_phys_fill(ddp, bp);
-		ddt_phys_addref(ddp);
-	} else {
-		cio = zio_write(zio, spa, txg, bp, zio->io_orig_abd,
-		    zio->io_orig_size, zio->io_orig_size, zp,
-		    zio_ddt_child_write_ready, NULL,
-		    zio_ddt_child_write_done, dde, zio->io_priority,
-		    ZIO_DDT_CHILD_FLAGS(zio), &zio->io_bookmark);
+	zfs_burst_dedup_dbgmsg("=====burst-dedup=====blk->blk_h_cksum: (%lx), zio: %px",
+						 bp->blk_h_cksum,
+						 zio);
 
-		zio_push_transform(cio, zio->io_abd, zio->io_size, 0, NULL);
-		dde->dde_lead_zio[p] = cio;
+	hddk_search.htddk_cksum = bp->blk_h_cksum;
+	hddk_search.htddk_type = HTDDT_TYPE_HEAD;
+	// compute head\tail's checksum and set htdde
+	htdde = htddt_lookup(hddt, &hddk_search, B_FALSE);
+	// found hdde and refcnt < zfs_burst_max_htdde_refcnt
+	if(htdde != NULL){
+		if(htdde->htdde_phys.htddp_refcnt < (uint64_t)zfs_burst_max_htdde_refcnt){
+			if(ddt_exist(ddt, htdde->htdde_phys.htddp_dde)){
+				goto new_bste;
+			}
+		}
 	}
 
+	zfs_burst_dedup_dbgmsg("=====burst-dedup=====blk->blk_t_cksum: (%lx), zio: %px",
+						 bp->blk_t_cksum,
+						 zio);
+
+	tddk_search.htddk_cksum = bp->blk_t_cksum;
+	tddk_search.htddk_type = HTDDT_TYPE_TAIL;
+	// compute head\tail's checksum and set htdde
+	htdde = htddt_lookup(tddt, &tddk_search, B_FALSE);
+	// found tdde and refcnt < zfs_burst_max_htdde_refcnt
+	if(htdde != NULL){
+		if(htdde->htdde_phys.htddp_refcnt < (uint64_t)zfs_burst_max_htdde_refcnt){
+			if(ddt_exist(ddt, htdde->htdde_phys.htddp_dde)){
+				goto new_bste;
+			}
+		}
+	}
+
+	goto new_htdde;
+// ------------------------------------------------------------------------------------------
+
+new_bste:
+
+	if(htdde->htdde_phys.htddp_dde->dde_lead_zio[htdde->htdde_phys.htddp_dde_p] != NULL){
+		/*
+		   we should create a new dde now and just view this block as a totally new block.
+		   We do not create any new htdde so that we are more likely to avoid this situation happening again.
+		   Note that the new dde cannot be burst deduped because we do not create any htdde.
+		*/
+		zfs_burst_dedup_dbgmsg("=====burst-dedup=====not ready, new dde, zio: %px", zio);
+		goto new_zio;
+
+
+	}
+
+	ddt_remove(ddt, dde);
+
+	// create new bste
+	bstk_search.bstk_cksum = bp->blk_cksum;
+	bste = bstt_lookup(bstt, &bstk_search, B_TRUE);
+
+
+	htddt_bstp_fill(htdde, &(bste->bste_phys));
+
+	htddt_phys_addref(zio, &(htdde->htdde_phys));
+
+	blkptr_t based_blk;
+	ddt_phys_t *bstp_ddp = &(bste->bste_phys.bstp_dde->dde_phys[bste->bste_phys.bstp_dde_p]);
+	abd_t *based_io_abd = abd_alloc(bste->bste_phys.bstp_abd_size, B_FALSE);
+	ddt_bp_create(ddt->ddt_checksum, &(bste->bste_phys.bstp_dde->dde_key), bstp_ddp, &based_blk);
+
+
+	zio_t *based_io = zio_read(zio, zio->io_spa, &based_blk,
+	based_io_abd, based_io_abd->abd_size, NULL, NULL, zio->io_priority,
+	ZIO_DDT_CHILD_FLAGS(zio), &zio->io_bookmark);
+
+	zio_wait(based_io);
+
+	burst_t *burst = &(bste->bste_phys.bstp_burst);
+	bstt_create_burst(burst, based_io_abd, based_io_abd->abd_size, zio->io_orig_abd, zio->io_orig_size);
+	abd_free(based_io_abd);
+
+	ASSERT3U(BP_GET_LSIZE(bp), ==, BP_GET_PSIZE(bp));
+	BP_SET_PSIZE(bp, burst->burst_abd_size);
+	BP_SET_COMPRESS(bp, ZIO_COMPRESS_BURST);
+
+	zio_t *burst_io = zio_write(zio, zio->io_spa, zio->io_txg, bp, burst->burst_abd,
+		burst->burst_abd_size, burst->burst_abd_size, &zio->io_prop,
+		zio_ddt_burst_write_ready, NULL,
+		zio_ddt_burst_write_done, bste, zio->io_priority,
+		ZIO_DDT_CHILD_FLAGS(zio), &zio->io_bookmark);
+
+	bste->bste_lead_burst_io = burst_io;
+
 	ddt_exit(ddt);
+	zio_nowait(burst_io);
+	return (zio);
 
+// -------------------------------------------------------------------------------------------
+
+new_htdde:
+	htdde = htddt_lookup(hddt, &hddk_search, B_TRUE);
+	htdde->htdde_phys.htddp_dde = dde;
+	htdde->htdde_phys.htddp_dde_p = p;
+	htdde->htdde_phys.htddp_refcnt = 0;
+	htdde->htdde_phys.htddp_abd_size = zio->io_orig_size;
+
+	htdde = htddt_lookup(tddt, &tddk_search, B_TRUE);
+	htdde->htdde_phys.htddp_dde = dde;
+	htdde->htdde_phys.htddp_dde_p = p;
+	htdde->htdde_phys.htddp_refcnt = 0;
+	htdde->htdde_phys.htddp_abd_size = zio->io_orig_size;
+
+new_zio: ;
+
+	zio_t *cio = zio_write(zio, spa, txg, bp, zio->io_orig_abd,
+							zio->io_orig_size, zio->io_orig_size, zp,
+							zio_ddt_child_write_ready, NULL, 
+							zio_ddt_child_write_done, dde, zio->io_priority,
+							ZIO_DDT_CHILD_FLAGS(zio), &zio->io_bookmark);
+	zio_push_transform(cio, zio->io_abd, zio->io_size, 0, NULL);
+	dde->dde_lead_zio[p] = cio;
+
+	ddt_exit(ddt);
 	zio_nowait(cio);
-
 	return (zio);
 }
 
@@ -3484,18 +3920,58 @@ zio_ddt_free(zio_t *zio)
 	ddt_entry_t *dde;
 	ddt_phys_t *ddp;
 
+	//burst dedup variables
+	boolean_t found_dde = B_FALSE;
+	bstt_t *bstt = bstt_select(spa, bp);
+	bstt_key_t bstk_search;
+	bstt_entry_t *bste;
+	ddt_entry_t *based_dde;
+	ddt_phys_t *based_ddp;
+
 	ASSERT(BP_GET_DEDUP(bp));
 	ASSERT(zio->io_child_type == ZIO_CHILD_LOGICAL);
 
 	ddt_enter(ddt);
-	freedde = dde = ddt_lookup(ddt, bp, B_TRUE);
-	if (dde) {
+	// freedde = dde = ddt_lookup(ddt, bp, B_TRUE);
+	// if (dde) {
+	// 	ddp = ddt_phys_select(dde, bp);
+	// 	if (ddp)
+	// 		ddt_phys_decref(ddp);
+	// }
+	// ddt_exit(ddt);
+
+	// return (zio);
+	freedde = dde = ddt_lookup(ddt, bp, B_FALSE, &found_dde);
+	if (found_dde) {
 		ddp = ddt_phys_select(dde, bp);
-		if (ddp)
+		if (ddp){
 			ddt_phys_decref(ddp);
+		}
+		ddt_exit(ddt);
+		return (zio);
+	}
+
+	// find bste in bstt
+	// bstt_enter(bstt);
+	dde = NULL;
+	bstk_search.bstk_cksum = bp->blk_cksum;
+	bste = bstt_lookup(bstt, &bstk_search, B_FALSE);
+	if(bste != NULL){
+		based_dde = bste->bste_phys.bstp_dde;
+		if(ddt_exist(ddt, based_dde)){
+			based_ddp = &(based_dde->dde_phys[bste->bste_phys.bstp_dde_p]);
+			if (based_ddp){
+				ddt_phys_decref(based_ddp);
+				bste->bste_phys.bstp_refcnt--;
+				ddt_exit(ddt);
+				return (zio);
+			}
+		}
+	}
+	else{
+		zfs_burst_dedup_dbgmsg("=====burst-dedup=====This could not happen!");
 	}
 	ddt_exit(ddt);
-
 	return (zio);
 }
 
@@ -4654,8 +5130,8 @@ zio_done(zio_t *zio)
 			ASSERT(zio->io_children[c][w] == 0);
 
 	if (zio->io_bp != NULL && !BP_IS_EMBEDDED(zio->io_bp)) {
-		ASSERT(zio->io_bp->blk_pad[0] == 0);
-		ASSERT(zio->io_bp->blk_pad[1] == 0);
+		ASSERT(zio->io_bp->blk_h_cksum == 0);
+		ASSERT(zio->io_bp->blk_t_cksum == 0);
 		ASSERT(memcmp(zio->io_bp, &zio->io_bp_copy,
 		    sizeof (blkptr_t)) == 0 ||
 		    (zio->io_bp == zio_unique_parent(zio)->io_bp));
